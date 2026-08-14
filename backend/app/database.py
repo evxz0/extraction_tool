@@ -6,7 +6,10 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data.db")
+if os.environ.get("VERCEL"):
+    DB_FILE = "/tmp/data.db"
+else:
+    DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data.db")
 
 
 class DatabaseManager:
