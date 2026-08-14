@@ -20,26 +20,17 @@ def parse_indonesian_amount(amt_str: str) -> float:
 
 def normalize_bank_date(g1: str, g2: str, g3: str) -> Dict[str, Any]:
     """
-    Parse (g1, g2, g3) into valid Year, Month, Day.
-    Standard Indonesian bank statement format: YY MM DD or DD MM YY.
+    Parse (g1, g2, g3) as DD MM YY format.
+    Example:
+      26 02 24 -> 26/02/2024 (Day 26, Month 02, Year 2024)
+      05 06 26 -> 05/06/2026 (Day 05, Month 06, Year 2026)
     """
-    v1, v2, v3 = int(g1), int(g2), int(g3)
+    day = int(g1)
+    month = int(g2)
+    yy = int(g3)
     
-    # Heuristic: if v1 in [23, 24, 25, 26, 27] -> YY MM DD
-    if 20 <= v1 <= 35:
-        year = 2000 + v1
-        month = v2
-        day = v3
-    # If v3 in [23, 24, 25, 26, 27] -> DD MM YY
-    elif 20 <= v3 <= 35:
-        year = 2000 + v3
-        month = v2
-        day = v1
-    else:
-        # Fallback assumption: YY MM DD with current decade
-        year = 2000 + v1 if v1 < 100 else v1
-        month = v2
-        day = v3
+    # 2-digit year (e.g. 24 -> 2024, 25 -> 2025, 26 -> 2026)
+    year = 2000 + yy if yy < 100 else yy
 
     # Sanity bounds check
     month = max(1, min(12, month))
@@ -62,15 +53,14 @@ def parse_recap_log(raw_text: str) -> Dict[str, Any]:
     Parse banking log text file using PRD regex specifications:
     - Block split: r'(?:\r?\n)(?=36\s+)' or r'(?=\b36\s+.*\bPEMINDAHAN\b)'
     - Account: r'PEMINDAHAN\s+KE\s+(\d+)'
-    - Date: r'(?:21|01)\s+(\d{2})(\d{2})(\d{2})'
-    - Amount: r'(\d{1,3}(?:\.\d{3})*,\d{2}-?)'
+    - Date: r'(?:21|01)\s+(\d{2})(\d{2})(\d{2})' (Format DD MM YY)
+    - Debit Amount: r'(\d{1,3}(?:\.\d{3})*,\d{2}-)'
     """
     # Split text into blocks
     blocks = re.split(r'(?:\r?\n)(?=36\s+)|(?=\b36\s+.*\bPEMINDAHAN\b)', raw_text)
     
     account_regex = re.compile(r'PEMINDAHAN\s+KE\s+(\d+)', re.IGNORECASE)
     date_regex = re.compile(r'(?:21|01)\s+(\d{2})(\d{2})(\d{2})')
-    amount_regex = re.compile(r'(\d{1,3}(?:\.\d{3})*,\d{2}-?)')
 
     transactions: List[Dict[str, Any]] = []
     unique_accounts: Set[str] = set()
@@ -83,31 +73,43 @@ def parse_recap_log(raw_text: str) -> Dict[str, Any]:
 
         acc_match = account_regex.search(block_clean)
         date_match = date_regex.search(block_clean)
-        amt_match = amount_regex.search(block_clean)
 
-        if acc_match and date_match and amt_match:
+        # Debit transaction amount (ends with '-')
+        debit_match = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})-', block_clean)
+        if debit_match:
+            amount_val = parse_indonesian_amount(debit_match.group(1))
+            raw_amt_str = debit_match.group(0)
+        else:
+            # Fallback: capture first formatted nominal
+            amt_match = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})', block_clean)
+            if amt_match:
+                amount_val = parse_indonesian_amount(amt_match.group(1))
+                raw_amt_str = amt_match.group(1)
+            else:
+                amount_val = 0.0
+                raw_amt_str = ""
+
+        if acc_match and date_match and amount_val > 0:
             acc_no = acc_match.group(1).strip()
             date_info = normalize_bank_date(date_match.group(1), date_match.group(2), date_match.group(3))
-            amount_val = parse_indonesian_amount(amt_match.group(1))
 
-            if amount_val > 0:
-                unique_accounts.add(acc_no)
-                years_detected.add(date_info["year"])
-                transactions.append({
-                    "account_number": acc_no,
-                    "year": date_info["year"],
-                    "month": date_info["month"],
-                    "day": date_info["day"],
-                    "iso_date": date_info["iso_date"],
-                    "display_date": date_info["display_date"],
-                    "amount": amount_val,
-                    "raw_amount_str": amt_match.group(1)
-                })
+            unique_accounts.add(acc_no)
+            years_detected.add(date_info["year"])
+            transactions.append({
+                "account_number": acc_no,
+                "year": date_info["year"],
+                "month": date_info["month"],
+                "day": date_info["day"],
+                "iso_date": date_info["iso_date"],
+                "display_date": date_info["display_date"],
+                "amount": amount_val,
+                "raw_amount_str": raw_amt_str
+            })
 
-    # Sort transactions by date
+    # Sort transactions chronologically by date
     transactions.sort(key=lambda x: x["iso_date"])
     sorted_accounts = sorted(list(unique_accounts))
-    sorted_years = sorted(list(years_detected)) or [datetime.datetime.now().year]
+    sorted_years = sorted(list(years_detected)) or [2024, 2025, 2026]
 
     return {
         "total_transactions": len(transactions),
@@ -194,8 +196,8 @@ def generate_dual_sheet_excel(
         cell_name.alignment = Alignment(horizontal="center", vertical="center")
         cell_name.border = thin_border
 
-        # Row 4: Account Number
-        cell_acc = ws1.cell(row=4, column=col_idx, value=f"No. Rek: {acc}")
+        # Row 4: Direct Account Number (No 'No. Rek:' text)
+        cell_acc = ws1.cell(row=4, column=col_idx, value=str(acc))
         cell_acc.font = font_header
         cell_acc.fill = fill_slate
         cell_acc.alignment = Alignment(horizontal="center", vertical="center")
@@ -334,8 +336,8 @@ def generate_dual_sheet_excel(
             c_name.font = font_regular
             c_name.border = thin_border
 
-            # Account No
-            c_acc = ws2.cell(row=ws2_row, column=3, value=acc)
+            # Account No (Pure number)
+            c_acc = ws2.cell(row=ws2_row, column=3, value=str(acc))
             c_acc.alignment = Alignment(horizontal="center", vertical="center")
             c_acc.font = font_regular
             c_acc.border = thin_border

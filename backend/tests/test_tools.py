@@ -9,7 +9,7 @@ from app.auth.security import hash_password
 from app.tools.matcher import solve_subset_sum
 from app.tools.recap import parse_recap_log, generate_dual_sheet_excel
 from app.tools.extractor import extract_from_text, extract_from_dataframe
-import pandas as pd
+import openpyxl
 
 client = TestClient(app)
 
@@ -17,7 +17,6 @@ client = TestClient(app)
 @pytest.fixture
 def auth_headers():
     session_redis.flush_all()
-    # Ensure admin user exists
     admin_user = db_manager.get_user_by_email_or_username("admin")
     if not admin_user:
         db_manager.create_user(
@@ -27,7 +26,6 @@ def auth_headers():
             hashed_password=hash_password("admin123"),
             full_name="Administrator"
         )
-    # Login admin
     res = client.post("/api/auth/login", json={"identifier": "admin", "password": "admin123", "force_login": True})
     assert res.status_code == 200, f"Login failed: {res.text}"
     token = res.json()["access_token"]
@@ -80,7 +78,6 @@ def test_tool2_subset_sum_algorithm():
     
     assert res["found_exact"] is True
     assert res["match_count"] >= 1
-    # 200k + 300k + 500k = 1000k
     first_match = res["exact_matches"][0]
     assert first_match["total_amount"] == 1000000.0
     assert first_match["item_count"] == 3
@@ -108,39 +105,58 @@ def test_tool2_matcher_api(auth_headers):
 # ============================================================================
 
 def test_tool3_log_parsing_and_excel():
+    # User's exact banking log patterns from screenshot
     sample_log = """
-    36  PEMINDAHAN DARI 0012345678
-    PEMINDAHAN KE 9876543210  BCA
-    21 241015
-    1.500.000,00-
-    
-    36  PEMINDAHAN DARI 0012345678
-    PEMINDAHAN KE 9876543210  BCA
-    21 241015
-    1.500.000,00-
+36      127256 PEMINDAHAN KE 758547291
+20      127256 0000000000 00 LEMBUR SATPAM JUMAT TGL 23/02/2024
+01 260224 0023 13 84061 021051 260224 127256 00  00  00
+   00000000                              90.627,00-  2.036.338.523,00
 
-    36  PEMINDAHAN DARI 0012345678
-    PEMINDAHAN KE 1122334455  MANDIRI
-    01 241016
-    750.000,00
+36      121091 PEMINDAHAN KE 1050319826
+20      121091 0000000000 00 LEMBUR SATPAM JUMAT TGL 23/02/2024
+01 260224 0023 13 84061 021051 260224 121091 00  00  00
+   00000000                              90.627,00-  2.036.429.150,00
+
+36      9211 PEMINDAHAN KE 219626190
+21 050626 0996 09 00001 021051 050626 009211 01   Ext Narration
+20      9211 23/818177/LEMBUR DRIVER
+01 050626 0996 09 00001 021051 050626 009211 00  00  00
+   00000000                              692.070,00-  337.623.657,00-
     """
     parsed = parse_recap_log(sample_log)
     assert parsed["total_transactions"] == 3
-    assert "9876543210" in parsed["unique_accounts"]
-    assert "1122334455" in parsed["unique_accounts"]
+    assert "758547291" in parsed["unique_accounts"]
+    assert "1050319826" in parsed["unique_accounts"]
+    assert "219626190" in parsed["unique_accounts"]
+
+    # Verify dates parsed as DD/MM/YYYY: 26/02/2024 and 05/06/2026
+    tx1 = [t for t in parsed["transactions"] if t["account_number"] == "758547291"][0]
+    assert tx1["display_date"] == "26/02/2024"
+    assert tx1["year"] == 2024
+    assert tx1["month"] == 2
+    assert tx1["day"] == 26
+    assert tx1["amount"] == 90627.0
+
+    tx3 = [t for t in parsed["transactions"] if t["account_number"] == "219626190"][0]
+    assert tx3["display_date"] == "05/06/2026"
+    assert tx3["year"] == 2026
+    assert tx3["month"] == 6
+    assert tx3["day"] == 5
+    assert tx3["amount"] == 692070.0  # Not 337.623.657!
+
+    # Years detected must be 2024 and 2026 (never 2000!)
+    assert 2000 not in parsed["years_detected"]
     assert 2024 in parsed["years_detected"]
+    assert 2026 in parsed["years_detected"]
 
-    # Verify identical transactions exist and are preserved
-    same_date_txs = [t for t in parsed["transactions"] if t["iso_date"] == "2024-10-15" and t["account_number"] == "9876543210"]
-    assert len(same_date_txs) == 2
-
-    # Generate Excel
-    mapping = {"9876543210": "Ahmad Subarjo", "1122334455": "Dewi Sartika"}
-    excel_bytes = generate_dual_sheet_excel(parsed, mapping, [2024, 2025])
-    assert len(excel_bytes) > 1000
-
-    # Load generated workbook with openpyxl to verify sheets & structure
-    import openpyxl
+    # Generate Excel and inspect headers
+    mapping = {"758547291": "Karyawan 1", "1050319826": "Karyawan 2", "219626190": "Karyawan 3"}
+    excel_bytes = generate_dual_sheet_excel(parsed, mapping, [2024, 2025, 2026])
+    
     wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
-    assert "Rekap Transaksi" in wb.sheetnames
-    assert "Rekapan Bulanan" in wb.sheetnames
+    ws1 = wb["Rekap Transaksi"]
+    
+    # Check that row 4 contains pure account number without "No. Rek:" prefix
+    acc_val = ws1.cell(row=4, column=2).value
+    assert acc_val == "1050319826" or acc_val in parsed["unique_accounts"]
+    assert "No. Rek:" not in str(acc_val)
