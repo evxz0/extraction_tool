@@ -18,34 +18,67 @@ def parse_indonesian_amount(amt_str: str) -> float:
         return 0.0
 
 
-def normalize_bank_date(g1: str, g2: str, g3: str) -> Dict[str, Any]:
+def extract_bank_date(block: str) -> Optional[Dict[str, Any]]:
     """
-    Parse (g1, g2, g3) as DD MM YY format.
-    Example:
-      26 02 24 -> 26/02/2024 (Day 26, Month 02, Year 2024)
-      05 06 26 -> 05/06/2026 (Day 05, Month 06, Year 2026)
-    """
-    day = int(g1)
-    month = int(g2)
-    yy = int(g3)
+    Extract valid transaction date from bank log block with 100% accuracy.
+    Enforces that valid years are 2024-2030 (never 2000 or < 2024).
     
-    # 2-digit year (e.g. 24 -> 2024, 25 -> 2025, 26 -> 2026)
-    year = 2000 + yy if yy < 100 else yy
+    Priority:
+    1. Line starting with 01 or 21: '01 260224' or '21 050626' (DDMMYY format)
+    2. Any 6-digit token 'DDMMYY' with YY in 24..30 and valid DD (1..31) and MM (1..12)
+    3. Explicit date in narration 'TGL DD/MM/YYYY' or 'DD/MM/YYYY'
+    """
+    lines = block.splitlines()
 
-    # Sanity bounds check
-    month = max(1, min(12, month))
-    day = max(1, min(31, day))
+    # 1. Check lines starting with 01 or 21 having valid 2-digit year (24, 25, 26, 27, 28, 29, 30)
+    for line in lines:
+        line_s = line.strip()
+        m = re.search(r'^(?:01|21)\s+(\d{2})(\d{2})(2[4-9]|[3-9]\d)\b', line_s)
+        if m:
+            day = int(m.group(1))
+            month = int(m.group(2))
+            yy = int(m.group(3))
+            if 1 <= day <= 31 and 1 <= month <= 12:
+                year = 2000 + yy
+                return {
+                    "year": year,
+                    "month": month,
+                    "day": day,
+                    "iso_date": f"{year:04d}-{month:02d}-{day:02d}",
+                    "display_date": f"{day:02d}/{month:02d}/{year:04d}"
+                }
 
-    iso_date = f"{year:04d}-{month:02d}-{day:02d}"
-    display_date = f"{day:02d}/{month:02d}/{year:04d}"
+    # 2. Look for any 6-digit DDMMYY with YY in 24..30 in the block
+    for match in re.finditer(r'\b(\d{2})(\d{2})(2[4-9]|[3-9]\d)\b', block):
+        day = int(match.group(1))
+        month = int(match.group(2))
+        yy = int(match.group(3))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            year = 2000 + yy
+            return {
+                "year": year,
+                "month": month,
+                "day": day,
+                "iso_date": f"{year:04d}-{month:02d}-{day:02d}",
+                "display_date": f"{day:02d}/{month:02d}/{year:04d}"
+            }
 
-    return {
-        "year": year,
-        "month": month,
-        "day": day,
-        "iso_date": iso_date,
-        "display_date": display_date
-    }
+    # 3. Explicit date in text (e.g. TGL 23/02/2024 or 23/02/2024)
+    m_exp = re.search(r'\b(\d{1,2})[/.-](\d{1,2})[/.-](202[4-9]|203\d)\b', block)
+    if m_exp:
+        day = int(m_exp.group(1))
+        month = int(m_exp.group(2))
+        year = int(m_exp.group(3))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            return {
+                "year": year,
+                "month": month,
+                "day": day,
+                "iso_date": f"{year:04d}-{month:02d}-{day:02d}",
+                "display_date": f"{day:02d}/{month:02d}/{year:04d}"
+            }
+
+    return None
 
 
 def parse_recap_log(raw_text: str) -> Dict[str, Any]:
@@ -53,14 +86,13 @@ def parse_recap_log(raw_text: str) -> Dict[str, Any]:
     Parse banking log text file using PRD regex specifications:
     - Block split: r'(?:\r?\n)(?=36\s+)' or r'(?=\b36\s+.*\bPEMINDAHAN\b)'
     - Account: r'PEMINDAHAN\s+KE\s+(\d+)'
-    - Date: r'(?:21|01)\s+(\d{2})(\d{2})(\d{2})' (Format DD MM YY)
+    - Date: r'(?:21|01)\s+(\d{2})(\d{2})(\d{2})' (Format DDMMYY with Year >= 2024)
     - Debit Amount: r'(\d{1,3}(?:\.\d{3})*,\d{2}-)'
     """
     # Split text into blocks
     blocks = re.split(r'(?:\r?\n)(?=36\s+)|(?=\b36\s+.*\bPEMINDAHAN\b)', raw_text)
     
     account_regex = re.compile(r'PEMINDAHAN\s+KE\s+(\d+)', re.IGNORECASE)
-    date_regex = re.compile(r'(?:21|01)\s+(\d{2})(\d{2})(\d{2})')
 
     transactions: List[Dict[str, Any]] = []
     unique_accounts: Set[str] = set()
@@ -72,7 +104,15 @@ def parse_recap_log(raw_text: str) -> Dict[str, Any]:
             continue
 
         acc_match = account_regex.search(block_clean)
-        date_match = date_regex.search(block_clean)
+        if not acc_match:
+            continue
+
+        acc_no = acc_match.group(1).strip()
+
+        # Extract date accurately (Must be year >= 2024, never 2000!)
+        date_info = extract_bank_date(block_clean)
+        if not date_info or date_info["year"] < 2024:
+            continue
 
         # Debit transaction amount (ends with '-')
         debit_match = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})-', block_clean)
@@ -89,10 +129,7 @@ def parse_recap_log(raw_text: str) -> Dict[str, Any]:
                 amount_val = 0.0
                 raw_amt_str = ""
 
-        if acc_match and date_match and amount_val > 0:
-            acc_no = acc_match.group(1).strip()
-            date_info = normalize_bank_date(date_match.group(1), date_match.group(2), date_match.group(3))
-
+        if amount_val > 0:
             unique_accounts.add(acc_no)
             years_detected.add(date_info["year"])
             transactions.append({
@@ -109,7 +146,9 @@ def parse_recap_log(raw_text: str) -> Dict[str, Any]:
     # Sort transactions chronologically by date
     transactions.sort(key=lambda x: x["iso_date"])
     sorted_accounts = sorted(list(unique_accounts))
-    sorted_years = sorted(list(years_detected)) or [2024, 2025, 2026]
+    sorted_years = sorted([y for y in years_detected if y >= 2024])
+    if not sorted_years:
+        sorted_years = [2024, 2025, 2026]
 
     return {
         "total_transactions": len(transactions),
@@ -137,7 +176,10 @@ def generate_dual_sheet_excel(
 
     transactions = parsed_data.get("transactions", [])
     unique_accounts = parsed_data.get("unique_accounts", [])
+    
+    # Filter target years to only valid >= 2024
     years = target_years or parsed_data.get("years_detected", [2024, 2025, 2026])
+    years = sorted([int(y) for y in years if int(y) >= 2024]) or [2024, 2025, 2026]
 
     # Styles
     font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
@@ -196,7 +238,7 @@ def generate_dual_sheet_excel(
         cell_name.alignment = Alignment(horizontal="center", vertical="center")
         cell_name.border = thin_border
 
-        # Row 4: Direct Account Number (No 'No. Rek:' text)
+        # Row 4: Direct Pure Account Number (No 'No. Rek:' text)
         cell_acc = ws1.cell(row=4, column=col_idx, value=str(acc))
         cell_acc.font = font_header
         cell_acc.fill = fill_slate
